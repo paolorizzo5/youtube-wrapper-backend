@@ -2,12 +2,22 @@ const express = require('express');
 const cors = require('cors');
 const { exec, spawn } = require('child_process');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const app = express();
 app.use(cors());
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
+
+// Write cookies to temp file if env var is set
+let COOKIES_FILE = null;
+if (process.env.YOUTUBE_COOKIES) {
+  COOKIES_FILE = path.join(os.tmpdir(), 'yt_cookies.txt');
+  fs.writeFileSync(COOKIES_FILE, process.env.YOUTUBE_COOKIES);
+}
 
 // Search videos using YouTube Data API v3
 app.get('/search', async (req, res) => {
@@ -80,8 +90,9 @@ app.get('/stream', (req, res) => {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   // Get the best audio-only stream URL
+  const cookiesArg = COOKIES_FILE ? `--cookies "${COOKIES_FILE}"` : '';
   exec(
-    `yt-dlp --js-runtimes node -f bestaudio --get-url "${url}"`,
+    `yt-dlp --js-runtimes node ${cookiesArg} -f bestaudio --get-url "${url}"`,
     { timeout: 15000 },
     (error, stdout, stderr) => {
       if (error) {
@@ -101,13 +112,11 @@ app.get('/proxy', (req, res) => {
 
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  const ytdlp = spawn('yt-dlp', [
-    '--js-runtimes', 'node',
-    '-f', 'bestaudio',
-    '-o', '-',
-    '--quiet',
-    url,
-  ]);
+  const ytdlpArgs = ['--js-runtimes', 'node'];
+  if (COOKIES_FILE) ytdlpArgs.push('--cookies', COOKIES_FILE);
+  ytdlpArgs.push('-f', 'bestaudio', '-o', '-', '--quiet', url);
+
+  const ytdlp = spawn('yt-dlp', ytdlpArgs);
 
   res.setHeader('Content-Type', 'audio/webm');
   res.setHeader('Transfer-Encoding', 'chunked');
