@@ -81,7 +81,7 @@ app.get('/stream', (req, res) => {
 
   // Get the best audio-only stream URL
   exec(
-    `yt-dlp -f bestaudio --get-url "${url}"`,
+    `yt-dlp --js-runtimes node -f bestaudio --get-url "${url}"`,
     { timeout: 15000 },
     (error, stdout, stderr) => {
       if (error) {
@@ -102,6 +102,7 @@ app.get('/proxy', (req, res) => {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   const ytdlp = spawn('yt-dlp', [
+    '--js-runtimes', 'node',
     '-f', 'bestaudio',
     '-o', '-',
     '--quiet',
