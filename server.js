@@ -14,9 +14,11 @@ const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 
 // Write cookies to temp file if env var is set
 let COOKIES_FILE = null;
-if (process.env.YOUTUBE_COOKIES) {
+if (process.env.YOUTUBE_COOKIES_B64) {
   COOKIES_FILE = path.join(os.tmpdir(), 'yt_cookies.txt');
-  fs.writeFileSync(COOKIES_FILE, process.env.YOUTUBE_COOKIES);
+  const decoded = Buffer.from(process.env.YOUTUBE_COOKIES_B64, 'base64');
+  fs.writeFileSync(COOKIES_FILE, decoded);
+  console.log(`Cookies file written: ${COOKIES_FILE} (${decoded.toString().split('\n').length} lines)`);
 }
 
 // Search videos using YouTube Data API v3
