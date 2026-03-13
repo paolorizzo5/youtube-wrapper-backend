@@ -182,71 +182,91 @@ app.get('/video/:videoId', async (req, res) => {
 });
 
 // Get related videos based on a videoId
+// Strategy 1 (primary): yt-dlp --dump-json → related_videos field (YouTube's own algorithm, no quota)
+// Strategy 2 (fallback): YouTube Data API search by artist/channel name only
+// Strategy 3 (fallback): youtube-sr search by artist name
 app.get('/related', async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
 
-  let searchQuery = null;
+  // ── Strategy 1: yt-dlp related_videos ────────────────────────────────────
+  try {
+    const info = await new Promise((resolve, reject) => {
+      const cookiesArg = COOKIES_FILE ? `--cookies "${COOKIES_FILE}"` : '';
+      exec(
+        `yt-dlp --js-runtimes node ${cookiesArg} --no-playlist --dump-json "https://www.youtube.com/watch?v=${videoId}"`,
+        { timeout: 20000 },
+        (err, stdout) => {
+          if (err) return reject(err);
+          try { resolve(JSON.parse(stdout.trim())); }
+          catch { reject(new Error('Failed to parse yt-dlp output')); }
+        }
+      );
+    });
 
-  // Try to get video title from YouTube Data API
+    const related = info.related_videos || [];
+    const items = related
+      .filter((v) => v.id && v.id !== videoId)
+      .slice(0, 10)
+      .map((v) => ({
+        videoId: v.id,
+        title: decodeHtml(v.title || ''),
+        channel: decodeHtml(v.uploader || v.channel || ''),
+        thumbnail: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
+      }));
+
+    if (items.length > 0) return res.json({ items });
+    // If yt-dlp returned no related videos, fall through to API strategy
+  } catch (err) {
+    console.warn('yt-dlp related_videos failed, trying API:', err.message);
+  }
+
+  // ── Strategy 2: YouTube Data API — search by channel name only ────────────
+  // Searching by artist name (not song title) avoids getting 20 versions of the same song
+  let artistName = null;
   try {
     const videoRes = await axios.get(`${YOUTUBE_API_BASE}/videos`, {
       params: { key: YOUTUBE_API_KEY, id: videoId, part: 'snippet' },
     });
-    const video = videoRes.data.items[0];
-    if (!video) return res.status(404).json({ error: 'Video not found' });
-    searchQuery = `${video.snippet.title} ${video.snippet.channelTitle}`;
+    const video = videoRes.data.items?.[0];
+    if (video) artistName = video.snippet.channelTitle;
 
-    const searchRes = await axios.get(`${YOUTUBE_API_BASE}/search`, {
-      params: {
-        key: YOUTUBE_API_KEY,
-        q: searchQuery,
-        part: 'snippet',
-        type: 'video',
-        maxResults: 11,
-        videoCategoryId: '10',
-      },
-    });
+    if (artistName) {
+      const searchRes = await axios.get(`${YOUTUBE_API_BASE}/search`, {
+        params: {
+          key: YOUTUBE_API_KEY,
+          q: artistName,
+          part: 'snippet',
+          type: 'video',
+          maxResults: 11,
+          videoCategoryId: '10',
+        },
+      });
 
-    const items = searchRes.data.items
-      .filter((item) => item.id.videoId !== videoId)
-      .slice(0, 10)
-      .map((item) => ({
-        videoId: item.id.videoId,
-        title: decodeHtml(item.snippet.title),
-        channel: decodeHtml(item.snippet.channelTitle),
-        thumbnail: item.snippet.thumbnails.medium.url,
-      }));
+      const items = searchRes.data.items
+        .filter((item) => item.id.videoId !== videoId)
+        .slice(0, 10)
+        .map((item) => ({
+          videoId: item.id.videoId,
+          title: decodeHtml(item.snippet.title),
+          channel: decodeHtml(item.snippet.channelTitle),
+          thumbnail: item.snippet.thumbnails.medium.url,
+        }));
 
-    return res.json({ items });
+      return res.json({ items });
+    }
   } catch (err) {
     if (!isQuotaError(err)) {
-      console.error('Related error:', err.response?.data || err.message);
+      console.error('Related API error:', err.response?.data || err.message);
       return res.status(500).json({ error: 'Failed to get related videos' });
     }
     console.warn('YouTube API quota exceeded — falling back to youtube-sr for related');
   }
 
-  // Fallback: use yt-dlp to get the title if we don't have it yet, then search via youtube-sr
+  // ── Strategy 3: youtube-sr — search by artist name ────────────────────────
   try {
-    if (!searchQuery) {
-      // Get title directly from the video page via yt-dlp --dump-json
-      searchQuery = await new Promise((resolve, reject) => {
-        exec(
-          `yt-dlp --js-runtimes node --no-playlist --dump-json "https://www.youtube.com/watch?v=${videoId}"`,
-          { timeout: 15000 },
-          (err, stdout) => {
-            if (err) return reject(err);
-            try {
-              const info = JSON.parse(stdout.trim());
-              resolve(`${info.title} ${info.uploader || ''}`);
-            } catch { reject(new Error('Failed to parse yt-dlp output')); }
-          }
-        );
-      });
-    }
-
-    const results = await YouTube.search(searchQuery, { limit: 11, type: 'video', safeSearch: false });
+    const query = artistName || videoId;
+    const results = await YouTube.search(query, { limit: 11, type: 'video', safeSearch: false });
     const items = results
       .filter((v) => v.id !== videoId)
       .slice(0, 10)
@@ -260,7 +280,7 @@ app.get('/related', async (req, res) => {
     return res.json({ items, source: 'fallback' });
   } catch (fallbackErr) {
     console.error('Related fallback error:', fallbackErr.message);
-    return res.status(503).json({ error: 'Related unavailable: quota exceeded and fallback failed' });
+    return res.status(503).json({ error: 'Related unavailable' });
   }
 });
 
