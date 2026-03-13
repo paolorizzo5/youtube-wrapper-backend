@@ -147,6 +147,46 @@ app.get('/video/:videoId', async (req, res) => {
   }
 });
 
+// Get related videos based on a videoId
+app.get('/related', async (req, res) => {
+  const { videoId } = req.query;
+  if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
+
+  try {
+    const videoRes = await axios.get(`${YOUTUBE_API_BASE}/videos`, {
+      params: { key: YOUTUBE_API_KEY, id: videoId, part: 'snippet' },
+    });
+    const video = videoRes.data.items[0];
+    if (!video) return res.status(404).json({ error: 'Video not found' });
+
+    const searchRes = await axios.get(`${YOUTUBE_API_BASE}/search`, {
+      params: {
+        key: YOUTUBE_API_KEY,
+        q: `${video.snippet.title} ${video.snippet.channelTitle}`,
+        part: 'snippet',
+        type: 'video',
+        maxResults: 11,
+        videoCategoryId: '10',
+      },
+    });
+
+    const items = searchRes.data.items
+      .filter((item) => item.id.videoId !== videoId)
+      .slice(0, 10)
+      .map((item) => ({
+        videoId: item.id.videoId,
+        title: item.snippet.title,
+        channel: item.snippet.channelTitle,
+        thumbnail: item.snippet.thumbnails.medium.url,
+      }));
+
+    res.json({ items });
+  } catch (err) {
+    console.error('Related error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to get related videos' });
+  }
+});
+
 // Extract audio stream URL using yt-dlp
 app.get('/stream', (req, res) => {
   const { videoId } = req.query;
