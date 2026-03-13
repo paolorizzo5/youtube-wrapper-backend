@@ -8,6 +8,69 @@ const os = require('os');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+// ── Playlist persistence ──────────────────────────────────────────────────────
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const PLAYLISTS_FILE = path.join(DATA_DIR, 'playlists.json');
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function readPlaylists() {
+  try {
+    return JSON.parse(fs.readFileSync(PLAYLISTS_FILE, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function writePlaylists(data) {
+  fs.writeFileSync(PLAYLISTS_FILE, JSON.stringify(data), 'utf8');
+}
+
+// GET /playlists
+app.get('/playlists', (req, res) => {
+  res.json(readPlaylists());
+});
+
+// POST /playlists  { name }
+app.post('/playlists', (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Missing name' });
+  const all = readPlaylists();
+  const playlist = { id: Date.now().toString(), name, tracks: [] };
+  writePlaylists([...all, playlist]);
+  res.json(playlist);
+});
+
+// DELETE /playlists/:id
+app.delete('/playlists/:id', (req, res) => {
+  const all = readPlaylists();
+  writePlaylists(all.filter((p) => p.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+// POST /playlists/:id/tracks  { videoId, title, channel, thumbnail }
+app.post('/playlists/:id/tracks', (req, res) => {
+  const all = readPlaylists();
+  const p = all.find((p) => p.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Playlist not found' });
+  if (!p.tracks.find((t) => t.videoId === req.body.videoId)) {
+    p.tracks.push(req.body);
+    writePlaylists(all);
+  }
+  res.json(p);
+});
+
+// DELETE /playlists/:id/tracks/:videoId
+app.delete('/playlists/:id/tracks/:videoId', (req, res) => {
+  const all = readPlaylists();
+  const p = all.find((p) => p.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Playlist not found' });
+  p.tracks = p.tracks.filter((t) => t.videoId !== req.params.videoId);
+  writePlaylists(all);
+  res.json(p);
+});
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
