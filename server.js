@@ -128,6 +128,22 @@ app.get('/search', async (req, res) => {
       publishedAt: item.snippet.publishedAt,
     }));
 
+    // Batch-fetch durations (1 API unit for all 20 results)
+    try {
+      const detailsRes = await axios.get(`${YOUTUBE_API_BASE}/videos`, {
+        params: {
+          key: YOUTUBE_API_KEY,
+          id: items.map((i) => i.videoId).join(','),
+          part: 'contentDetails',
+        },
+      });
+      const durationMap = {};
+      detailsRes.data.items.forEach((d) => { durationMap[d.id] = d.contentDetails.duration; });
+      items.forEach((item) => { item.duration = durationMap[item.videoId] || null; });
+    } catch {
+      // Non-critical: search still works without durations
+    }
+
     return res.json({ items, nextPageToken: response.data.nextPageToken || null });
   } catch (err) {
     if (!isQuotaError(err)) {
@@ -145,6 +161,7 @@ app.get('/search', async (req, res) => {
       title: v.title || '',
       channel: v.channel?.name || '',
       thumbnail: v.thumbnail?.url || '',
+      duration: v.durationFormatted || null,
       publishedAt: null,
     }));
     return res.json({ items, nextPageToken: null, source: 'fallback' });
@@ -284,54 +301,110 @@ app.get('/related', async (req, res) => {
   }
 });
 
-// Extract audio stream URL using yt-dlp
-app.get('/stream', (req, res) => {
+// ── Stream URL cache ──────────────────────────────────────────────────────────
+const streamCache = new Map(); // videoId → { url, expiresAt }
+const CACHE_TTL_MS = 50 * 60 * 1000; // 50 minutes
+
+function getCachedUrl(videoId) {
+  const entry = streamCache.get(videoId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { streamCache.delete(videoId); return null; }
+  return entry.url;
+}
+
+function setCachedUrl(videoId, url) {
+  streamCache.set(videoId, { url, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+function extractStreamUrl(videoId) {
+  return new Promise((resolve, reject) => {
+    const cookiesArg = COOKIES_FILE ? `--cookies "${COOKIES_FILE}"` : '';
+    exec(
+      `yt-dlp --js-runtimes node ${cookiesArg} --no-check-formats -f bestaudio --get-url "https://www.youtube.com/watch?v=${videoId}"`,
+      { timeout: 20000 },
+      (error, stdout, stderr) => {
+        if (error) return reject(new Error(stderr || error.message));
+        resolve(stdout.trim().split('\n')[0]);
+      }
+    );
+  });
+}
+
+// Extract audio stream URL (with cache)
+app.get('/stream', async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
 
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const cached = getCachedUrl(videoId);
+  if (cached) return res.json({ streamUrl: cached });
 
-  // Get the best audio-only stream URL
-  const cookiesArg = COOKIES_FILE ? `--cookies "${COOKIES_FILE}"` : '';
-  exec(
-    `yt-dlp --js-runtimes node ${cookiesArg} -f bestaudio --get-url "${url}"`,
-    { timeout: 15000 },
-    (error, stdout, stderr) => {
-      if (error) {
-        console.error('yt-dlp error:', stderr);
-        return res.status(500).json({ error: 'Failed to extract stream URL' });
-      }
-      const streamUrl = stdout.trim().split('\n')[0];
-      res.json({ streamUrl });
-    }
-  );
+  try {
+    const streamUrl = await extractStreamUrl(videoId);
+    setCachedUrl(videoId, streamUrl);
+    res.json({ streamUrl });
+  } catch (err) {
+    console.error('yt-dlp error:', err.message);
+    res.status(500).json({ error: 'Failed to extract stream URL' });
+  }
 });
 
-// Proxy audio stream (optional, for clients that can't access the direct URL)
-app.get('/proxy', (req, res) => {
+// Proxy audio stream — uses cache if available (no yt-dlp delay), otherwise extracts first
+app.get('/proxy', async (req, res) => {
   const { videoId } = req.query;
   if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
 
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  let streamUrl = getCachedUrl(videoId);
 
-  const ytdlpArgs = ['--js-runtimes', 'node'];
-  if (COOKIES_FILE) ytdlpArgs.push('--cookies', COOKIES_FILE);
-  ytdlpArgs.push('-f', 'bestaudio', '-o', '-', '--quiet', url);
+  if (!streamUrl) {
+    try {
+      streamUrl = await extractStreamUrl(videoId);
+      setCachedUrl(videoId, streamUrl);
+    } catch (err) {
+      console.error('yt-dlp error:', err.message);
+      return res.status(500).json({ error: 'Failed to extract stream URL' });
+    }
+  }
 
-  const ytdlp = spawn('yt-dlp', ytdlpArgs);
+  // Proxy from CDN — forward Range header to support seeking
+  try {
+    const upstreamHeaders = {};
+    if (req.headers['range']) upstreamHeaders['Range'] = req.headers['range'];
 
-  res.setHeader('Content-Type', 'audio/webm');
-  res.setHeader('Transfer-Encoding', 'chunked');
+    const upstream = await axios.get(streamUrl, {
+      responseType: 'stream',
+      headers: upstreamHeaders,
+    });
 
-  ytdlp.stdout.pipe(res);
+    res.setHeader('Content-Type', upstream.headers['content-type'] || 'audio/webm');
+    res.setHeader('Accept-Ranges', 'bytes');
+    if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+    if (upstream.headers['content-range']) res.setHeader('Content-Range', upstream.headers['content-range']);
+    res.status(upstream.status);
 
-  ytdlp.stderr.on('data', (data) => console.error('yt-dlp stderr:', data.toString()));
+    upstream.data.pipe(res);
+    req.on('close', () => upstream.data.destroy());
+  } catch (err) {
+    // URL might be expired — evict cache and report error
+    streamCache.delete(videoId);
+    console.error('Proxy stream error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to proxy stream' });
+  }
+});
 
-  ytdlp.on('close', (code) => {
-    if (code !== 0) console.error(`yt-dlp exited with code ${code}`);
+// Pre-warm cache for upcoming tracks (fire-and-forget)
+app.post('/prefetch', (req, res) => {
+  const { videoIds } = req.body;
+  if (!Array.isArray(videoIds)) return res.status(400).json({ error: 'videoIds must be array' });
+
+  res.json({ ok: true }); // respond immediately, extract in background
+
+  videoIds.slice(0, 3).forEach((videoId) => {
+    if (!getCachedUrl(videoId)) {
+      extractStreamUrl(videoId)
+        .then((url) => setCachedUrl(videoId, url))
+        .catch((err) => console.warn(`Prefetch failed ${videoId}:`, err.message));
+    }
   });
-
-  req.on('close', () => ytdlp.kill());
 });
 
 const PORT = process.env.PORT || 3000;
